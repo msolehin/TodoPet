@@ -29,17 +29,39 @@ PETS = {
     "Lizard":  {"emoji": "🦎", "phrases": ["*tongue flick*", "Hssss", "Just chillin'", "Bug snack?"]},
 }
 
-# Modern dark-gray palette
-BG       = "#1a1a1a"   # window background
-PANEL    = "#242424"   # task rows, pet area
-PANEL2   = "#2e2e2e"   # buttons, inputs
-HOVER    = "#3a3a3a"   # hover state
-BORDER   = "#2a2a2a"   # subtle separator
-FG       = "#ececec"   # primary text
-MUTED    = "#808080"   # secondary text
-ACCENT   = "#d4d4d4"   # highlights
-GREEN    = "#4ade80"   # success / done
-RED      = "#ef4444"   # close / delete
+THEMES = {
+    "Default": {
+        "BG": "#1a1a1a", "PANEL": "#242424", "PANEL2": "#2e2e2e", "HOVER": "#3a3a3a",
+        "BORDER": "#2a2a2a", "FG": "#ececec", "MUTED": "#808080", "ACCENT": "#d4d4d4",
+        "GREEN": "#4ade80", "RED": "#ef4444"
+    },
+    "Light Mode": {
+        "BG": "#f9fafb", "PANEL": "#ffffff", "PANEL2": "#f3f4f6", "HOVER": "#e5e7eb",
+        "BORDER": "#d1d5db", "FG": "#111827", "MUTED": "#6b7280", "ACCENT": "#3b82f6",
+        "GREEN": "#22c55e", "RED": "#ef4444"
+    },
+    "Ghibli Mode": {
+        "BG": "#2c3e2e", "PANEL": "#3a4f3c", "PANEL2": "#476049", "HOVER": "#547157",
+        "BORDER": "#3a4f3c", "FG": "#e8ecd7", "MUTED": "#a3b19b", "ACCENT": "#facc15",
+        "GREEN": "#4ade80", "RED": "#ef4444"
+    },
+    "Pinky Mode": {
+        "BG": "#fdf2f8", "PANEL": "#fce7f3", "PANEL2": "#fbcfe8", "HOVER": "#f9a8d4",
+        "BORDER": "#f9a8d4", "FG": "#831843", "MUTED": "#db2777", "ACCENT": "#be185d",
+        "GREEN": "#10b981", "RED": "#e11d48"
+    }
+}
+
+BG = PANEL = PANEL2 = HOVER = BORDER = FG = MUTED = ACCENT = GREEN = RED = ""
+
+def set_theme(name):
+    global BG, PANEL, PANEL2, HOVER, BORDER, FG, MUTED, ACCENT, GREEN, RED
+    t = THEMES.get(name, THEMES["Default"])
+    BG, PANEL, PANEL2, HOVER = t["BG"], t["PANEL"], t["PANEL2"], t["HOVER"]
+    BORDER, FG, MUTED, ACCENT = t["BORDER"], t["FG"], t["MUTED"], t["ACCENT"]
+    GREEN, RED = t["GREEN"], t["RED"]
+
+set_theme("Default")
 
 
 def load_data():
@@ -51,11 +73,13 @@ def load_data():
             d.setdefault("active", [])
             d.setdefault("history", [])
             d.setdefault("pet", "Cat")
+            d.setdefault("theme", "Default")
+            d.setdefault("opacity", 1.0)
             d.setdefault("next_id", 1)
             return d
         except Exception:
             pass
-    return {"active": [], "history": [], "pet": "Cat", "next_id": 1}
+    return {"active": [], "history": [], "pet": "Cat", "theme": "Default", "opacity": 1.0, "next_id": 1}
 
 
 def save_data(d):
@@ -606,6 +630,11 @@ class FloatingPet:
         self._animate()
         self._chatter_loop()
 
+    def update_theme(self):
+        canvas_bg = self.TRANSP if self._transparent else PANEL2
+        self.win.configure(bg=canvas_bg)
+        self.canvas.configure(bg=canvas_bg)
+
     def set_pet(self, value):
         self._draw_pet()
 
@@ -848,12 +877,17 @@ class TodoApp:
     def __init__(self, root):
         self.root = root
         self.data = load_data()
+        set_theme(self.data.get("theme", "Default"))
 
         # Frameless window — small, top-right by default
         root.title("TodoPet")  # used by single-instance FindWindowW
         root.overrideredirect(True)
         root.configure(bg=BG)
         root.attributes("-topmost", True)
+        try:
+            root.attributes("-alpha", self.data.get("opacity", 1.0))
+        except tk.TclError:
+            pass
 
         default_w, default_h = 300, 400
         screen_w = root.winfo_screenwidth()
@@ -917,6 +951,35 @@ class TodoApp:
         root.after(50, lambda: force_taskbar_presence(root))
         # Re-assert topmost when window is mapped (e.g., after restoring from minimized)
         root.bind("<Map>", self._on_map)
+
+    def _apply_theme(self):
+        set_theme(self.data.get("theme", "Default"))
+
+        style = ttk.Style()
+        style.configure(".", background=BG, foreground=FG, fieldbackground=PANEL, borderwidth=0)
+        style.configure("TMenubutton", background=PANEL2, foreground=FG, padding=4, relief="flat", borderwidth=0, arrowcolor=FG)
+        style.map("TMenubutton", background=[("active", HOVER)], foreground=[("active", FG)])
+        style.configure("Vertical.TScrollbar", background=PANEL2, troughcolor=BG, bordercolor=BG, arrowcolor=MUTED, gripcount=0, relief="flat")
+        style.map("Vertical.TScrollbar", background=[("active", HOVER)])
+        style.configure("Horizontal.TScale", background=BG, troughcolor=PANEL2, bordercolor=BG, lightcolor=ACCENT, darkcolor=ACCENT)
+
+        self.root.configure(bg=BG)
+
+        for w in self.root.winfo_children():
+            if isinstance(w, tk.Toplevel):
+                continue
+            w.destroy()
+
+        self.tab_buttons = {}
+        self.list_canvas = self.list_inner = self.list_window = self.entry = None
+
+        self._build_titlebar()
+        self._build_body()
+        self._build_resize_grip()
+        self._on_map(None)
+
+        if self.pet:
+            self.pet.update_theme()
 
     # ---------------- titlebar ----------------
 
@@ -1121,6 +1184,31 @@ class TodoApp:
         wrap = tk.Frame(self.content, bg=BG)
         wrap.pack(fill="both", expand=True, padx=14, pady=10)
 
+        # Theme picker
+        tk.Label(wrap, text="THEME", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        self.theme_var = tk.StringVar(value=self.data.get("theme", "Default"))
+        theme_menu = ttk.OptionMenu(wrap, self.theme_var, self.theme_var.get(),
+                                    *THEMES.keys(), command=self._on_theme_change)
+        theme_menu.configure(style="TMenubutton")
+        theme_menu.pack(anchor="w", fill="x", pady=(4, 14))
+
+        # Opacity slider
+        opacity_header = tk.Frame(wrap, bg=BG)
+        opacity_header.pack(fill="x")
+        tk.Label(opacity_header, text="OPACITY", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(side="left")
+        current_opacity = self.data.get("opacity", 1.0)
+        opacity_lbl = tk.Label(opacity_header, text=f"{int(current_opacity * 100)}%",
+                               bg=BG, fg=FG, font=("Segoe UI", 9))
+        opacity_lbl.pack(side="right")
+
+        self.opacity_var = tk.DoubleVar(value=current_opacity)
+        opacity_slider = ttk.Scale(wrap, from_=0.1, to=1.0,
+                                   orient="horizontal", variable=self.opacity_var,
+                                   command=lambda v, l=opacity_lbl: self._on_opacity_change(v, l))
+        opacity_slider.pack(fill="x", pady=(4, 14))
+
         # Pet picker
         tk.Label(wrap, text="PET", bg=BG, fg=MUTED,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w")
@@ -1164,6 +1252,28 @@ class TodoApp:
                 pass
         if self.pet:
             self.pet.set_size(size)
+
+    def _on_opacity_change(self, value, label_widget):
+        try:
+            opacity = float(value)
+        except (TypeError, ValueError):
+            return
+        if label_widget:
+            try:
+                label_widget.configure(text=f"{int(opacity * 100)}%")
+            except tk.TclError:
+                pass
+        try:
+            self.root.attributes("-alpha", opacity)
+        except tk.TclError:
+            pass
+        self.data["opacity"] = opacity
+        save_data(self.data)
+
+    def _on_theme_change(self, value):
+        self.data["theme"] = value
+        save_data(self.data)
+        self._apply_theme()
 
     def _clear_history_inplace(self):
         if messagebox.askyesno("Clear history?",
