@@ -76,10 +76,14 @@ def load_data():
             d.setdefault("theme", "Default")
             d.setdefault("opacity", 1.0)
             d.setdefault("next_id", 1)
+            d.setdefault("pomodoro_enabled", True)
+            d.setdefault("pomodoro_work", 25 * 60)
+            d.setdefault("pomodoro_rest", 5 * 60)
             return d
         except Exception:
             pass
-    return {"active": [], "history": [], "pet": "Cat", "theme": "Default", "opacity": 1.0, "next_id": 1}
+    return {"active": [], "history": [], "pet": "Cat", "theme": "Default", "opacity": 1.0, "next_id": 1,
+            "pomodoro_enabled": True, "pomodoro_work": 25 * 60, "pomodoro_rest": 5 * 60}
 
 
 def save_data(d):
@@ -902,6 +906,15 @@ class TodoApp:
         self._rs = None
         self._task_labels = []
 
+        # Pomodoro state
+        self._pomo_mode = "work"  # "work" or "rest"
+        self._pomo_remaining = self.data.get("pomodoro_work", 25 * 60)
+        self._pomo_running = False
+        self._pomo_after = None
+        self._pomo_time_lbl = None
+        self._pomo_mode_lbl = None
+        self._pomo_toggle_btn = None
+
         # ttk theming for OptionMenu / Scrollbar
         style = ttk.Style()
         try:
@@ -1126,7 +1139,12 @@ class TodoApp:
                     bg=PANEL2, fg=FG, hover_bg=HOVER,
                     font=("Segoe UI", 11, "bold"), pad=(12, 5)).pack(side="right")
 
-        # Scrollable task list
+        # Pomodoro panel — pack first at the bottom so it stays visible
+        # even when the window is shrunk (Tk pack clips widgets in reverse order).
+        if self.data.get("pomodoro_enabled", True):
+            self._build_pomodoro_panel()
+
+        # Scrollable task list — fills the remaining space above the pomodoro panel.
         list_wrap = tk.Frame(self.content, bg=BG)
         list_wrap.pack(fill="both", expand=True, padx=10, pady=4)
 
@@ -1145,6 +1163,115 @@ class TodoApp:
         self.list_canvas.bind("<Leave>", lambda e: self.list_canvas.unbind_all("<MouseWheel>"))
 
         self._refresh_list()
+
+    # ---------------- pomodoro ----------------
+
+    def _pomo_color(self):
+        return RED if self._pomo_mode == "work" else GREEN
+
+    def _pomo_format(self, secs):
+        secs = max(0, int(secs))
+        return f"{secs // 60:02d}:{secs % 60:02d}"
+
+    def _build_pomodoro_panel(self):
+        # Pack at the bottom so the panel is reserved before the task list takes
+        # remaining space — keeps the timer visible even when the window is tiny.
+        panel = tk.Frame(self.content, bg=BG)
+        panel.pack(side="bottom", fill="x", padx=10, pady=(6, 8))
+        sep = tk.Frame(self.content, bg=BORDER, height=1)
+        sep.pack(side="bottom", fill="x", padx=10, pady=(4, 0))
+
+        color = self._pomo_color()
+        mode_text = "FOCUS" if self._pomo_mode == "work" else "REST"
+
+        self._pomo_time_lbl = tk.Label(panel, text=self._pomo_format(self._pomo_remaining),
+                                       bg=BG, fg=color, font=("Segoe UI", 28, "bold"))
+        self._pomo_time_lbl.pack(anchor="center", pady=(2, 0))
+        self._pomo_mode_lbl = tk.Label(panel, text=mode_text, bg=BG, fg=color,
+                                       font=("Segoe UI", 8, "bold"))
+        self._pomo_mode_lbl.pack(anchor="center")
+
+        btn_row = tk.Frame(panel, bg=BG)
+        btn_row.pack(pady=(4, 0))
+        start_text = "Pause" if self._pomo_running else "Start"
+        self._pomo_toggle_btn = HoverButton(btn_row, start_text, self._pomo_toggle,
+                                            bg=PANEL2, fg=FG, hover_bg=HOVER,
+                                            font=("Segoe UI", 9), pad=(10, 4))
+        self._pomo_toggle_btn.pack(side="left", padx=4)
+        HoverButton(btn_row, "Reset", self._pomo_reset,
+                    bg=PANEL2, fg=FG, hover_bg=HOVER,
+                    font=("Segoe UI", 9), pad=(10, 4)).pack(side="left", padx=4)
+        HoverButton(btn_row, "Skip", self._pomo_skip,
+                    bg=PANEL2, fg=FG, hover_bg=HOVER,
+                    font=("Segoe UI", 9), pad=(10, 4)).pack(side="left", padx=4)
+
+    def _pomo_update_labels(self):
+        if self._pomo_time_lbl is None:
+            return
+        try:
+            color = self._pomo_color()
+            self._pomo_time_lbl.configure(text=self._pomo_format(self._pomo_remaining), fg=color)
+            self._pomo_mode_lbl.configure(text=("FOCUS" if self._pomo_mode == "work" else "REST"), fg=color)
+            if self._pomo_toggle_btn is not None:
+                self._pomo_toggle_btn.configure(text="Pause" if self._pomo_running else "Start")
+        except tk.TclError:
+            pass
+
+    def _pomo_toggle(self):
+        if self._pomo_running:
+            self._pomo_running = False
+            if self._pomo_after is not None:
+                try:
+                    self.root.after_cancel(self._pomo_after)
+                except (tk.TclError, ValueError):
+                    pass
+                self._pomo_after = None
+        else:
+            self._pomo_running = True
+            self._pomo_tick()
+        self._pomo_update_labels()
+
+    def _pomo_reset(self):
+        self._pomo_running = False
+        if self._pomo_after is not None:
+            try:
+                self.root.after_cancel(self._pomo_after)
+            except (tk.TclError, ValueError):
+                pass
+            self._pomo_after = None
+        if self._pomo_mode == "work":
+            self._pomo_remaining = self.data.get("pomodoro_work", 25 * 60)
+        else:
+            self._pomo_remaining = self.data.get("pomodoro_rest", 5 * 60)
+        self._pomo_update_labels()
+
+    def _pomo_skip(self):
+        self._pomo_switch_mode(announce=False)
+        self._pomo_update_labels()
+
+    def _pomo_switch_mode(self, announce=True):
+        if self._pomo_mode == "work":
+            self._pomo_mode = "rest"
+            self._pomo_remaining = self.data.get("pomodoro_rest", 5 * 60)
+            if announce:
+                self._pet_say("Take a break!")
+        else:
+            self._pomo_mode = "work"
+            self._pomo_remaining = self.data.get("pomodoro_work", 25 * 60)
+            if announce:
+                self._pet_say("Focus time!")
+
+    def _pomo_tick(self):
+        if not self._pomo_running:
+            return
+        if self._pomo_remaining <= 0:
+            self._pomo_switch_mode(announce=True)
+            self._pomo_update_labels()
+            self._pomo_after = self.root.after(1000, self._pomo_tick)
+            return
+        self._pomo_remaining -= 1
+        self._pomo_update_labels()
+        self._pomo_after = self.root.after(1000, self._pomo_tick)
 
     def _render_history_view(self):
         hdr = tk.Frame(self.content, bg=BG)
@@ -1233,6 +1360,50 @@ class TodoApp:
                            command=lambda v, l=size_lbl: self._on_size_change(v, l))
         slider.pack(fill="x", pady=(4, 14))
 
+        # Pomodoro section
+        tk.Label(wrap, text="POMODORO", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+
+        pomo_enabled = bool(self.data.get("pomodoro_enabled", True))
+        self.pomo_enabled_var = tk.BooleanVar(value=pomo_enabled)
+        toggle_row = tk.Frame(wrap, bg=BG)
+        toggle_row.pack(fill="x", pady=(4, 6))
+        tk.Label(toggle_row, text="Show timer below tasks", bg=BG, fg=FG,
+                 font=("Segoe UI", 9)).pack(side="left")
+        chk = tk.Checkbutton(toggle_row, variable=self.pomo_enabled_var,
+                             bg=BG, fg=FG, activebackground=BG, activeforeground=FG,
+                             selectcolor=PANEL2, borderwidth=0, highlightthickness=0,
+                             command=self._on_pomo_enabled_change)
+        chk.pack(side="right")
+
+        work_row = tk.Frame(wrap, bg=BG)
+        work_row.pack(fill="x", pady=(2, 2))
+        tk.Label(work_row, text="Focus (min)", bg=BG, fg=FG,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.pomo_work_var = tk.IntVar(value=max(1, self.data.get("pomodoro_work", 1500) // 60))
+        work_spin = tk.Spinbox(work_row, from_=1, to=180, width=5,
+                               textvariable=self.pomo_work_var,
+                               bg=PANEL2, fg=FG, buttonbackground=PANEL2,
+                               relief="flat", highlightthickness=0, insertbackground=FG,
+                               command=self._on_pomo_work_change)
+        work_spin.pack(side="right")
+        work_spin.bind("<FocusOut>", lambda e: self._on_pomo_work_change())
+        work_spin.bind("<Return>", lambda e: self._on_pomo_work_change())
+
+        rest_row = tk.Frame(wrap, bg=BG)
+        rest_row.pack(fill="x", pady=(2, 14))
+        tk.Label(rest_row, text="Rest (min)", bg=BG, fg=FG,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.pomo_rest_var = tk.IntVar(value=max(1, self.data.get("pomodoro_rest", 300) // 60))
+        rest_spin = tk.Spinbox(rest_row, from_=1, to=120, width=5,
+                               textvariable=self.pomo_rest_var,
+                               bg=PANEL2, fg=FG, buttonbackground=PANEL2,
+                               relief="flat", highlightthickness=0, insertbackground=FG,
+                               command=self._on_pomo_rest_change)
+        rest_spin.pack(side="right")
+        rest_spin.bind("<FocusOut>", lambda e: self._on_pomo_rest_change())
+        rest_spin.bind("<Return>", lambda e: self._on_pomo_rest_change())
+
         # Hint
         tk.Label(wrap,
                  text="Tip: scroll the mouse wheel over the pet to resize too.\n"
@@ -1269,6 +1440,46 @@ class TodoApp:
             pass
         self.data["opacity"] = opacity
         save_data(self.data)
+
+    def _on_pomo_enabled_change(self):
+        enabled = bool(self.pomo_enabled_var.get())
+        self.data["pomodoro_enabled"] = enabled
+        save_data(self.data)
+        if not enabled:
+            self._pomo_running = False
+            if self._pomo_after is not None:
+                try:
+                    self.root.after_cancel(self._pomo_after)
+                except (tk.TclError, ValueError):
+                    pass
+                self._pomo_after = None
+            self._pomo_time_lbl = None
+            self._pomo_mode_lbl = None
+            self._pomo_toggle_btn = None
+
+    def _on_pomo_work_change(self):
+        try:
+            mins = int(self.pomo_work_var.get())
+        except (TypeError, ValueError, tk.TclError):
+            return
+        mins = max(1, min(180, mins))
+        self.data["pomodoro_work"] = mins * 60
+        save_data(self.data)
+        if self._pomo_mode == "work" and not self._pomo_running:
+            self._pomo_remaining = mins * 60
+            self._pomo_update_labels()
+
+    def _on_pomo_rest_change(self):
+        try:
+            mins = int(self.pomo_rest_var.get())
+        except (TypeError, ValueError, tk.TclError):
+            return
+        mins = max(1, min(120, mins))
+        self.data["pomodoro_rest"] = mins * 60
+        save_data(self.data)
+        if self._pomo_mode == "rest" and not self._pomo_running:
+            self._pomo_remaining = mins * 60
+            self._pomo_update_labels()
 
     def _on_theme_change(self, value):
         self.data["theme"] = value
