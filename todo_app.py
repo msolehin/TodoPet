@@ -1,4 +1,5 @@
 """TodoPet — frameless always-on-top to-do list with a wandering pet companion."""
+import ast
 import json
 import os
 import random
@@ -80,11 +81,13 @@ def load_data():
             d.setdefault("pomodoro_work", 25 * 60)
             d.setdefault("pomodoro_rest", 5 * 60)
             d.setdefault("focus_ids", [])
+            d.setdefault("custom_pets", [])
             return d
         except Exception:
             pass
     return {"active": [], "history": [], "pet": "Cat", "theme": "Default", "opacity": 1.0, "next_id": 1,
-            "pomodoro_enabled": True, "pomodoro_work": 25 * 60, "pomodoro_rest": 5 * 60, "focus_ids": []}
+            "pomodoro_enabled": True, "pomodoro_work": 25 * 60, "pomodoro_rest": 5 * 60,
+            "focus_ids": [], "custom_pets": []}
 
 
 def save_data(d):
@@ -575,6 +578,159 @@ PET_DRAWERS = {
     "Lizard": draw_lizard,
 }
 
+BUILTIN_PET_NAMES = frozenset(PET_DRAWERS.keys())
+
+
+def _make_custom_drawer(shapes):
+    """Build a draw function from a list of JSON-friendly shape dicts.
+    Coordinates and sizes are 0..1 fractions of the canvas size `s`.
+    Supported shape types: circle, oval, rect, polygon, line, arc.
+    """
+    def drawer(c, s):
+        for shape in shapes or []:
+            try:
+                t = shape.get("type")
+                fill = shape.get("fill", "")
+                outline = shape.get("outline", "")
+                width = shape.get("width", 1)
+                if t == "circle":
+                    cx = float(shape.get("cx", 0.5)) * s
+                    cy = float(shape.get("cy", 0.5)) * s
+                    r = float(shape.get("r", 0.3)) * s
+                    c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                  fill=fill, outline=outline or fill, width=width)
+                elif t == "oval":
+                    x = float(shape["x"]) * s
+                    y = float(shape["y"]) * s
+                    w = float(shape["w"]) * s
+                    h = float(shape["h"]) * s
+                    c.create_oval(x, y, x + w, y + h,
+                                  fill=fill, outline=outline or fill, width=width)
+                elif t in ("rect", "rectangle"):
+                    x = float(shape["x"]) * s
+                    y = float(shape["y"]) * s
+                    w = float(shape["w"]) * s
+                    h = float(shape["h"]) * s
+                    c.create_rectangle(x, y, x + w, y + h,
+                                       fill=fill, outline=outline or fill, width=width)
+                elif t == "polygon":
+                    flat = []
+                    for p in shape["points"]:
+                        flat.append(float(p[0]) * s)
+                        flat.append(float(p[1]) * s)
+                    c.create_polygon(*flat, fill=fill or "",
+                                     outline=outline or "", width=width)
+                elif t == "line":
+                    flat = []
+                    for p in shape["points"]:
+                        flat.append(float(p[0]) * s)
+                        flat.append(float(p[1]) * s)
+                    c.create_line(*flat, fill=fill or "#000000", width=width)
+                elif t == "arc":
+                    x = float(shape["x"]) * s
+                    y = float(shape["y"]) * s
+                    w = float(shape["w"]) * s
+                    h = float(shape["h"]) * s
+                    c.create_arc(x, y, x + w, y + h,
+                                 start=float(shape.get("start", 0)),
+                                 extent=float(shape.get("extent", 90)),
+                                 fill=fill or "",
+                                 outline=outline or fill or "",
+                                 width=width,
+                                 style=shape.get("style", "pieslice"))
+            except (KeyError, ValueError, TypeError, tk.TclError):
+                continue
+    return drawer
+
+
+def _compile_code_drawer(code, name_hint=""):
+    """Compile a user Python snippet into a draw(c, s) callable.
+
+    Accepts either a full `def draw_xxx(c, s): ...` block, or a bare body
+    that uses the names `c` (tk.Canvas) and `s` (size in px). The helpers
+    `_sphere` and `_eyes` (and `tk`) are available in the namespace.
+
+    Returns a callable that never raises — drawing errors are swallowed so
+    one bad pet does not crash the rendering loop.
+    """
+    code = (code or "").strip()
+    if not code:
+        return lambda c, s: None
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return lambda c, s: None
+
+    has_def = any(isinstance(n, ast.FunctionDef) for n in tree.body)
+    if not has_def:
+        # Wrap a bare body into a function body
+        indented = "\n".join("    " + ln for ln in code.splitlines())
+        code = "def __pet_draw(c, s):\n" + indented
+
+    namespace = {
+        "_sphere": _sphere,
+        "_eyes": _eyes,
+        "tk": tk,
+        "__builtins__": __builtins__,
+    }
+    try:
+        exec(compile(code, f"<custom_pet:{name_hint or 'unnamed'}>", "exec"),
+             namespace)
+    except Exception:
+        return lambda c, s: None
+
+    # Pick the draw function: prefer one named draw* with 2 params, else __pet_draw,
+    # else any user-defined callable with 2 params.
+    candidates = []
+    for k, v in namespace.items():
+        if not callable(v) or k in ("_sphere", "_eyes", "tk"):
+            continue
+        if k.startswith("__") and k != "__pet_draw":
+            continue
+        candidates.append((k, v))
+
+    fn = None
+    for k, v in candidates:
+        if k.startswith("draw"):
+            fn = v
+            break
+    if fn is None:
+        for k, v in candidates:
+            if k == "__pet_draw":
+                fn = v
+                break
+    if fn is None and candidates:
+        fn = candidates[-1][1]
+    if fn is None:
+        return lambda c, s: None
+
+    def safe_drawer(c, s, _fn=fn):
+        try:
+            _fn(c, s)
+        except Exception:
+            pass
+    return safe_drawer
+
+
+def register_custom_pet(entry):
+    name = (entry.get("name") or "").strip()
+    if not name or name in BUILTIN_PET_NAMES:
+        return
+    PETS[name] = {"emoji": entry.get("emoji") or "🐾",
+                  "phrases": list(entry.get("phrases") or ["Hi!"])}
+    if entry.get("code"):
+        PET_DRAWERS[name] = _compile_code_drawer(entry["code"], name)
+    else:
+        PET_DRAWERS[name] = _make_custom_drawer(entry.get("shapes") or [])
+
+
+def unregister_custom_pet(name):
+    if name in BUILTIN_PET_NAMES:
+        return
+    PETS.pop(name, None)
+    PET_DRAWERS.pop(name, None)
+
 
 class FloatingPet:
     """Frameless transparent always-on-top pet — colorful 3D vector pet drawn
@@ -882,6 +1038,8 @@ class TodoApp:
     def __init__(self, root):
         self.root = root
         self.data = load_data()
+        for entry in self.data.get("custom_pets", []):
+            register_custom_pet(entry)
         set_theme(self.data.get("theme", "Default"))
 
         # Frameless window — small, top-right by default
@@ -1472,7 +1630,34 @@ class TodoApp:
         text.configure(state="disabled")
 
     def _render_settings_view(self):
-        wrap = tk.Frame(self.content, bg=BG)
+        # Scrollable container so settings remain reachable when the window
+        # is resized small.
+        outer = tk.Frame(self.content, bg=BG)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        sb.pack(side="right", fill="y")
+        canvas.configure(yscrollcommand=sb.set)
+
+        wrap = tk.Frame(canvas, bg=BG)
+        win = canvas.create_window((0, 0), window=wrap, anchor="nw")
+        wrap.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win, width=e.width))
+
+        def _settings_wheel(event):
+            try:
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+            except tk.TclError:
+                pass
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _settings_wheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        # Inner padded frame — all setting widgets pack into this
+        wrap = tk.Frame(wrap, bg=BG)
         wrap.pack(fill="both", expand=True, padx=14, pady=10)
 
         # Theme picker
@@ -1506,7 +1691,25 @@ class TodoApp:
         pet_menu = ttk.OptionMenu(wrap, self.pet_var, self.pet_var.get(),
                                   *PETS.keys(), command=self._on_pet_change)
         pet_menu.configure(style="TMenubutton")
-        pet_menu.pack(anchor="w", fill="x", pady=(4, 14))
+        pet_menu.pack(anchor="w", fill="x", pady=(4, 8))
+
+        # Manage pets — list custom pets with delete, plus "Add" button
+        custom = self.data.get("custom_pets", [])
+        if custom:
+            for entry in custom:
+                row = tk.Frame(wrap, bg=PANEL)
+                row.pack(fill="x", pady=1)
+                tk.Label(row, text=f"{entry.get('emoji','🐾')}  {entry.get('name','?')}",
+                         bg=PANEL, fg=FG, font=("Segoe UI", 9),
+                         anchor="w", padx=8, pady=3).pack(side="left", fill="x", expand=True)
+                rm = HoverButton(row, "✕",
+                                 lambda n=entry.get("name", ""): self._remove_custom_pet(n),
+                                 bg=PANEL, fg=MUTED, hover_bg=PANEL, hover_fg=RED,
+                                 font=("Segoe UI", 9), pad=(8, 3))
+                rm.pack(side="right")
+        HoverButton(wrap, "+ Add Custom Pet", self._open_add_pet_dialog,
+                    bg=PANEL2, fg=FG, hover_bg=HOVER,
+                    font=("Segoe UI", 9), pad=(10, 4)).pack(anchor="w", pady=(6, 14))
 
         # Pet size slider
         size_header = tk.Frame(wrap, bg=BG)
@@ -1860,6 +2063,203 @@ class TodoApp:
     def _pet_say(self, msg):
         if self.pet:
             self.pet.say(msg)
+
+    # ---------------- pet management ----------------
+
+    def _remove_custom_pet(self, name):
+        if not name or name in BUILTIN_PET_NAMES:
+            return
+        if not messagebox.askyesno("Remove pet?",
+                                   f"Remove custom pet \"{name}\"? This can't be undone.",
+                                   parent=self.root):
+            return
+        self.data["custom_pets"] = [c for c in self.data.get("custom_pets", [])
+                                    if c.get("name") != name]
+        unregister_custom_pet(name)
+        if self.pet_var.get() == name:
+            self.pet_var.set("Cat")
+            self.data["pet"] = "Cat"
+            if self.pet:
+                self.pet.set_pet("Cat")
+        save_data(self.data)
+        self._render_view()
+
+    def _open_add_pet_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Add Custom Pet")
+        dlg.configure(bg=BG)
+        dlg.transient(self.root)
+        dlg.geometry("520x760")
+        try:
+            dlg.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+        sample = (
+            'def draw_pet(c, s):\n'
+            '    cx, cy = s / 2, s * 0.56\n'
+            '    R = s * 0.30\n'
+            '    for sign in (-1, 1):\n'
+            '        c.create_polygon(cx + sign * R * 0.65, cy - R * 0.55,\n'
+            '                         cx + sign * R * 1.05, cy - R * 1.45,\n'
+            '                         cx + sign * R * 0.18, cy - R * 0.85,\n'
+            '                         fill="#fbbf24", outline="#7c2d12", width=2)\n'
+            '        c.create_polygon(cx + sign * R * 0.6, cy - R * 0.6,\n'
+            '                         cx + sign * R * 0.82, cy - R * 1.18,\n'
+            '                         cx + sign * R * 0.32, cy - R * 0.85,\n'
+            '                         fill="#fb7185", outline="")\n'
+            '    _sphere(c, cx, cy, R, "#fbbf24", hi="#fef3c7", outline="#7c2d12")\n'
+            '    _eyes(c, cx - R * 0.32, cx + R * 0.32, cy - R * 0.05, R * 0.13)\n'
+            '    c.create_polygon(cx - R * 0.1, cy + R * 0.18, cx + R * 0.1, cy + R * 0.18,\n'
+            '                     cx, cy + R * 0.32,\n'
+            '                     fill="#ec4899", outline="#9f1239", width=1)\n'
+            '    c.create_line(cx, cy + R * 0.32, cx, cy + R * 0.42, fill="#7c2d12", width=1)\n'
+            '    c.create_arc(cx - R * 0.22, cy + R * 0.3, cx, cy + R * 0.55,\n'
+            '                 start=0, extent=-180, style="arc", outline="#7c2d12", width=1)\n'
+            '    c.create_arc(cx, cy + R * 0.3, cx + R * 0.22, cy + R * 0.55,\n'
+            '                 start=180, extent=180, style="arc", outline="#7c2d12", width=1)\n'
+            '    for sign in (-1, 1):\n'
+            '        for dy in (-3, 0, 3):\n'
+            '            c.create_line(cx + sign * R * 0.25, cy + R * 0.3 + dy,\n'
+            '                          cx + sign * R * 0.85, cy + R * 0.25 + dy * 1.5,\n'
+            '                          fill="#7c2d12", width=1)\n'
+        )
+
+        # Name / emoji / phrases
+        def field_label(text):
+            tk.Label(dlg, text=text, bg=BG, fg=MUTED,
+                     font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
+
+        def text_entry(initial=""):
+            e = tk.Entry(dlg, bg=PANEL2, fg=FG, relief="flat",
+                         insertbackground=FG, highlightthickness=0)
+            if initial:
+                e.insert(0, initial)
+            e.pack(fill="x", padx=12, ipady=4)
+            return e
+
+        field_label("NAME")
+        name_e = text_entry()
+        field_label("EMOJI")
+        emoji_e = text_entry("🐾")
+        field_label("PHRASES (comma-separated)")
+        phrases_e = text_entry("Hi!, Hello!")
+
+        field_label("PYTHON DRAW CODE")
+        code_wrap = tk.Frame(dlg, bg=BG)
+        code_wrap.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+        txt = tk.Text(code_wrap, bg=PANEL2, fg=FG, font=("Consolas", 9),
+                      relief="flat", insertbackground=FG, height=14, wrap="none",
+                      highlightthickness=0)
+        txt.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(code_wrap, orient="vertical", command=txt.yview)
+        sb.pack(side="right", fill="y")
+        txt.configure(yscrollcommand=sb.set)
+        txt.insert("1.0", sample)
+
+        field_label("PREVIEW")
+        preview = tk.Canvas(dlg, bg=BG, width=160, height=160,
+                            highlightthickness=1, highlightbackground=BORDER)
+        preview.pack(padx=12, pady=(0, 4))
+
+        err_lbl = tk.Label(dlg, text="", bg=BG, fg=RED,
+                           font=("Segoe UI", 8), anchor="w", justify="left",
+                           wraplength=480)
+        err_lbl.pack(fill="x", padx=12, pady=(2, 0))
+
+        help_lbl = tk.Label(
+            dlg,
+            text=("Write a function `def draw_pet(c, s): ...`  (or paste a bare body\n"
+                  "that uses `c` and `s`).\n"
+                  "  c   = tk.Canvas — use c.create_oval / _polygon / _line / _arc /\n"
+                  "        _rectangle (same API as Tkinter Canvas)\n"
+                  "  s   = pet size in pixels (scale every coord/radius from this)\n"
+                  "Helpers in scope:  _sphere(c, cx, cy, r, fill, hi=, outline=)\n"
+                  "                   _eyes(c, lx, rx, y, r)\n"
+                  "Colors: \"#rrggbb\" or named (\"red\", \"black\", ...)."),
+            bg=BG, fg=MUTED, font=("Consolas", 8),
+            anchor="w", justify="left")
+        help_lbl.pack(fill="x", padx=12, pady=(4, 0))
+
+        warn_lbl = tk.Label(
+            dlg,
+            text="⚠ Code runs every time TodoPet starts. Only paste code you trust.",
+            bg=BG, fg=RED, font=("Segoe UI", 8, "italic"),
+            anchor="w", justify="left")
+        warn_lbl.pack(fill="x", padx=12, pady=(2, 4))
+
+        def update_preview(*_):
+            raw = txt.get("1.0", "end")
+            try:
+                ast.parse(raw)
+                err_lbl.configure(text="")
+            except SyntaxError as ex:
+                err_lbl.configure(text=f"Syntax error on line {ex.lineno}: {ex.msg}")
+                return
+            preview.delete("all")
+            try:
+                _compile_code_drawer(raw, "preview")(preview, 160)
+            except Exception as ex:
+                err_lbl.configure(text=f"Draw error: {ex}")
+
+        def on_text_modified(_e=None):
+            # <<Modified>> fires on any content change (typing, paste via menu
+            # or Ctrl+V, programmatic insert). Reset the flag so it fires again.
+            try:
+                if txt.edit_modified():
+                    update_preview()
+                    txt.edit_modified(False)
+            except tk.TclError:
+                pass
+
+        txt.bind("<<Modified>>", on_text_modified)
+        # Also handle paste explicitly so the preview reflects clipboard content
+        # immediately even on platforms where <<Modified>> lags.
+        txt.bind("<<Paste>>", lambda e: dlg.after(1, update_preview))
+        txt.edit_modified(False)
+        update_preview()
+
+        btns = tk.Frame(dlg, bg=BG)
+        btns.pack(fill="x", padx=12, pady=10)
+
+        def do_save():
+            name = name_e.get().strip()
+            if not name:
+                err_lbl.configure(text="Name is required.")
+                return
+            existing_custom = {c.get("name") for c in self.data.get("custom_pets", [])}
+            if name in BUILTIN_PET_NAMES or (name in PETS and name not in existing_custom):
+                err_lbl.configure(text="Name conflicts with a built-in pet — choose another.")
+                return
+            code = txt.get("1.0", "end").rstrip()
+            if not code.strip():
+                err_lbl.configure(text="Code is required.")
+                return
+            try:
+                ast.parse(code)
+            except SyntaxError as ex:
+                err_lbl.configure(text=f"Syntax error on line {ex.lineno}: {ex.msg}")
+                return
+            emoji = (emoji_e.get().strip() or "🐾")
+            phrases = [p.strip() for p in phrases_e.get().split(",") if p.strip()]
+            if not phrases:
+                phrases = ["Hi!"]
+            entry = {"name": name, "emoji": emoji, "phrases": phrases, "code": code}
+
+            customs = self.data.setdefault("custom_pets", [])
+            customs[:] = [c for c in customs if c.get("name") != name]
+            customs.append(entry)
+            save_data(self.data)
+            register_custom_pet(entry)
+            dlg.destroy()
+            self._render_view()
+
+        HoverButton(btns, "Cancel", dlg.destroy,
+                    bg=PANEL2, fg=FG, hover_bg=HOVER,
+                    font=("Segoe UI", 9), pad=(14, 5)).pack(side="right", padx=(6, 0))
+        HoverButton(btns, "Save", do_save,
+                    bg=ACCENT, fg=BG, hover_bg=HOVER,
+                    font=("Segoe UI", 9, "bold"), pad=(16, 5)).pack(side="right")
 
 
 def main():
