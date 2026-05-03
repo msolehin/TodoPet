@@ -79,11 +79,12 @@ def load_data():
             d.setdefault("pomodoro_enabled", True)
             d.setdefault("pomodoro_work", 25 * 60)
             d.setdefault("pomodoro_rest", 5 * 60)
+            d.setdefault("focus_ids", [])
             return d
         except Exception:
             pass
     return {"active": [], "history": [], "pet": "Cat", "theme": "Default", "opacity": 1.0, "next_id": 1,
-            "pomodoro_enabled": True, "pomodoro_work": 25 * 60, "pomodoro_rest": 5 * 60}
+            "pomodoro_enabled": True, "pomodoro_work": 25 * 60, "pomodoro_rest": 5 * 60, "focus_ids": []}
 
 
 def save_data(d):
@@ -915,6 +916,11 @@ class TodoApp:
         self._pomo_mode_lbl = None
         self._pomo_toggle_btn = None
 
+        # Focus / drag state
+        self._focus_drop_frame = None
+        self._focus_inner = None
+        self._drag = None
+
         # ttk theming for OptionMenu / Scrollbar
         style = ttk.Style()
         try:
@@ -1115,6 +1121,11 @@ class TodoApp:
             w.destroy()
         self.list_canvas = self.list_inner = self.list_window = None
         self.entry = None
+        self._focus_drop_frame = None
+        self._focus_inner = None
+        self._pomo_time_lbl = None
+        self._pomo_mode_lbl = None
+        self._pomo_toggle_btn = None
         if self.view == "history":
             self._render_history_view()
         elif self.view == "settings":
@@ -1183,6 +1194,16 @@ class TodoApp:
 
         color = self._pomo_color()
         mode_text = "FOCUS" if self._pomo_mode == "work" else "REST"
+
+        # Focus drop zone — drag undone tasks here to mark them as ongoing.
+        self._focus_drop_frame = tk.Frame(panel, bg=PANEL2,
+                                          highlightthickness=1,
+                                          highlightbackground=BORDER,
+                                          highlightcolor=BORDER)
+        self._focus_drop_frame.pack(fill="x", pady=(0, 6))
+        self._focus_inner = tk.Frame(self._focus_drop_frame, bg=PANEL2)
+        self._focus_inner.pack(fill="x", padx=4, pady=4)
+        self._render_focus_list()
 
         self._pomo_time_lbl = tk.Label(panel, text=self._pomo_format(self._pomo_remaining),
                                        bg=BG, fg=color, font=("Segoe UI", 28, "bold"))
@@ -1272,6 +1293,149 @@ class TodoApp:
         self._pomo_remaining -= 1
         self._pomo_update_labels()
         self._pomo_after = self.root.after(1000, self._pomo_tick)
+
+    # ---------------- focus list (drag-onto-pomodoro) ----------------
+
+    def _render_focus_list(self):
+        if self._focus_inner is None:
+            return
+        try:
+            for w in self._focus_inner.winfo_children():
+                w.destroy()
+        except tk.TclError:
+            return
+
+        ids = self.data.get("focus_ids", [])
+        active_undone = {t["id"]: t for t in self.data["active"] if not t.get("completed")}
+        valid = [i for i in ids if i in active_undone]
+        if valid != ids:
+            self.data["focus_ids"] = valid
+            save_data(self.data)
+
+        if not valid:
+            tk.Label(self._focus_inner,
+                     text="↓ drag a task here to focus on it",
+                     bg=PANEL2, fg=MUTED, font=("Segoe UI", 8, "italic"),
+                     pady=4).pack()
+            return
+
+        for tid in valid:
+            t = active_undone[tid]
+            chip = tk.Frame(self._focus_inner, bg=PANEL)
+            chip.pack(fill="x", pady=1)
+
+            box = tk.Label(chip, text="○", bg=PANEL, fg=MUTED,
+                           font=("Segoe UI", 11), cursor="hand2", padx=6)
+            box.pack(side="left")
+            box.bind("<Button-1>", lambda e, x=tid: self.complete_todo(x))
+            box.bind("<Enter>", lambda e, w=box: w.configure(fg=GREEN, text="◉"))
+            box.bind("<Leave>", lambda e, w=box: w.configure(fg=MUTED, text="○"))
+
+            tk.Label(chip, text=t["text"], bg=PANEL, fg=FG,
+                     font=("Segoe UI", 9), anchor="w",
+                     wraplength=max(80, self.root.winfo_width() - 110)
+                     ).pack(side="left", fill="x", expand=True, pady=2)
+            rm = tk.Label(chip, text="✕", bg=PANEL, fg=MUTED, cursor="hand2",
+                          font=("Segoe UI", 9), padx=8)
+            rm.pack(side="right")
+            rm.bind("<Button-1>", lambda e, x=tid: self._remove_from_focus(x))
+            rm.bind("<Enter>", lambda e, w=rm: w.configure(fg=RED))
+            rm.bind("<Leave>", lambda e, w=rm: w.configure(fg=MUTED))
+
+    def _add_to_focus(self, tid):
+        ids = self.data.setdefault("focus_ids", [])
+        if tid in ids:
+            return
+        # only add if the task exists and is not done
+        if not any(t["id"] == tid and not t.get("completed") for t in self.data["active"]):
+            return
+        ids.append(tid)
+        save_data(self.data)
+        self._render_focus_list()
+        self._pet_say("Focusing!")
+
+    def _remove_from_focus(self, tid):
+        ids = self.data.get("focus_ids", [])
+        if tid in ids:
+            ids.remove(tid)
+            save_data(self.data)
+            self._render_focus_list()
+
+    # ---------------- drag and drop ----------------
+
+    def _drag_start(self, e, tid, text):
+        self._drag = {"tid": tid, "text": text, "ghost": None,
+                      "started": False, "x0": e.x_root, "y0": e.y_root}
+
+    def _drag_motion(self, e):
+        if not self._drag:
+            return
+        if not self._drag["started"]:
+            if abs(e.x_root - self._drag["x0"]) + abs(e.y_root - self._drag["y0"]) < 5:
+                return
+            self._drag["started"] = True
+
+        if self._drag["ghost"] is None:
+            g = tk.Toplevel(self.root)
+            g.overrideredirect(True)
+            try:
+                g.attributes("-topmost", True)
+                g.attributes("-alpha", 0.85)
+            except tk.TclError:
+                pass
+            tk.Label(g, text=self._drag["text"], bg=ACCENT, fg=BG,
+                     font=("Segoe UI", 9, "bold"), padx=8, pady=4).pack()
+            self._drag["ghost"] = g
+        try:
+            self._drag["ghost"].geometry(f"+{e.x_root + 14}+{e.y_root + 14}")
+        except tk.TclError:
+            pass
+
+        if self._focus_drop_frame is not None:
+            try:
+                over = self._is_over_focus_drop(e.x_root, e.y_root)
+                self._focus_drop_frame.configure(
+                    highlightbackground=ACCENT if over else BORDER,
+                    highlightcolor=ACCENT if over else BORDER)
+            except tk.TclError:
+                pass
+
+    def _drag_end(self, e):
+        if not self._drag:
+            return
+        started = self._drag["started"]
+        tid = self._drag["tid"]
+        ghost = self._drag["ghost"]
+        if ghost is not None:
+            try:
+                ghost.destroy()
+            except tk.TclError:
+                pass
+        if self._focus_drop_frame is not None:
+            try:
+                self._focus_drop_frame.configure(highlightbackground=BORDER,
+                                                 highlightcolor=BORDER)
+            except tk.TclError:
+                pass
+        if started and self._is_over_focus_drop(e.x_root, e.y_root):
+            self._add_to_focus(tid)
+        self._drag = None
+
+    def _is_over_focus_drop(self, x_root, y_root):
+        if self._focus_drop_frame is None:
+            return False
+        try:
+            w = self.root.winfo_containing(x_root, y_root)
+        except tk.TclError:
+            return False
+        while w is not None:
+            if w is self._focus_drop_frame:
+                return True
+            try:
+                w = w.master
+            except AttributeError:
+                return False
+        return False
 
     def _render_history_view(self):
         hdr = tk.Frame(self.content, bg=BG)
@@ -1594,6 +1758,15 @@ class TodoApp:
         lbl.pack(side="left", fill="x", expand=True, padx=2, pady=6)
         self._task_labels.append(lbl)
 
+        if not done:
+            lbl.configure(cursor="fleur")
+            tid_local = todo["id"]
+            text_local = todo["text"]
+            lbl.bind("<ButtonPress-1>",
+                     lambda e, x=tid_local, t=text_local: self._drag_start(e, x, t))
+            lbl.bind("<B1-Motion>", self._drag_motion)
+            lbl.bind("<ButtonRelease-1>", self._drag_end)
+
         rm = tk.Label(row, text="✕", bg=row_bg, fg=MUTED, cursor="hand2",
                       font=("Segoe UI", 10), padx=10)
         rm.pack(side="right", pady=4)
@@ -1628,8 +1801,11 @@ class TodoApp:
                     self._pet_say("Back to it!")
                 else:
                     t["completed"] = datetime.now().isoformat(timespec="seconds")
+                    if tid in self.data.get("focus_ids", []):
+                        self.data["focus_ids"].remove(tid)
                     save_data(self.data)
                     self._refresh_list()
+                    self._render_focus_list()
                     self._pet_say(random.choice(["Nice!", "Great job!", "🎉", "Yay!", "Crushed it!"]))
                 return
 
@@ -1664,8 +1840,11 @@ class TodoApp:
         for i, t in enumerate(self.data["active"]):
             if t["id"] == tid:
                 self.data["active"].pop(i)
+                if tid in self.data.get("focus_ids", []):
+                    self.data["focus_ids"].remove(tid)
                 save_data(self.data)
                 self._refresh_list()
+                self._render_focus_list()
                 self._pet_say("Gone!")
                 return
 
