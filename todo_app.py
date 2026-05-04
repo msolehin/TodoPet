@@ -1073,6 +1073,9 @@ class TodoApp:
         self._pomo_time_lbl = None
         self._pomo_mode_lbl = None
         self._pomo_toggle_btn = None
+        self._pomo_blinking = False
+        self._pomo_blink_on = False
+        self._pomo_blink_after = None
 
         # Focus / drag state
         self._focus_drop_frame = None
@@ -1384,6 +1387,12 @@ class TodoApp:
                     bg=PANEL2, fg=FG, hover_bg=HOVER,
                     font=("Segoe UI", 9), pad=(10, 4)).pack(side="left", padx=4)
 
+        # If we were blinking before the panel was rebuilt (e.g. tab switch),
+        # restart the blink on the new toggle button.
+        if self._pomo_blinking:
+            self._pomo_blinking = False  # let _start_blink re-arm cleanly
+            self._pomo_start_blink()
+
     def _pomo_update_labels(self):
         if self._pomo_time_lbl is None:
             return
@@ -1397,6 +1406,7 @@ class TodoApp:
             pass
 
     def _pomo_toggle(self):
+        self._pomo_stop_blink()
         if self._pomo_running:
             self._pomo_running = False
             if self._pomo_after is not None:
@@ -1411,6 +1421,7 @@ class TodoApp:
         self._pomo_update_labels()
 
     def _pomo_reset(self):
+        self._pomo_stop_blink()
         self._pomo_running = False
         if self._pomo_after is not None:
             try:
@@ -1425,6 +1436,7 @@ class TodoApp:
         self._pomo_update_labels()
 
     def _pomo_skip(self):
+        self._pomo_stop_blink()
         self._pomo_switch_mode(announce=False)
         self._pomo_update_labels()
 
@@ -1444,13 +1456,52 @@ class TodoApp:
         if not self._pomo_running:
             return
         if self._pomo_remaining <= 0:
+            # Phase finished — switch mode but DO NOT auto-start the next one.
+            # Instead, blink the Start button so the user knows to act.
+            self._pomo_running = False
+            self._pomo_after = None
             self._pomo_switch_mode(announce=True)
             self._pomo_update_labels()
-            self._pomo_after = self.root.after(1000, self._pomo_tick)
+            self._pomo_start_blink()
             return
         self._pomo_remaining -= 1
         self._pomo_update_labels()
         self._pomo_after = self.root.after(1000, self._pomo_tick)
+
+    def _pomo_start_blink(self):
+        if self._pomo_blinking:
+            return
+        self._pomo_blinking = True
+        self._pomo_blink_on = False
+        self._pomo_blink_step()
+
+    def _pomo_stop_blink(self):
+        self._pomo_blinking = False
+        if self._pomo_blink_after is not None:
+            try:
+                self.root.after_cancel(self._pomo_blink_after)
+            except (tk.TclError, ValueError):
+                pass
+            self._pomo_blink_after = None
+        if self._pomo_toggle_btn is not None:
+            try:
+                self._pomo_toggle_btn.configure(bg=PANEL2, fg=FG)
+            except tk.TclError:
+                pass
+
+    def _pomo_blink_step(self):
+        if not self._pomo_blinking:
+            return
+        if self._pomo_toggle_btn is not None:
+            try:
+                self._pomo_blink_on = not self._pomo_blink_on
+                if self._pomo_blink_on:
+                    self._pomo_toggle_btn.configure(bg=self._pomo_color(), fg=BG)
+                else:
+                    self._pomo_toggle_btn.configure(bg=PANEL2, fg=FG)
+            except tk.TclError:
+                pass
+        self._pomo_blink_after = self.root.after(500, self._pomo_blink_step)
 
     # ---------------- focus list (drag-onto-pomodoro) ----------------
 
@@ -1641,10 +1692,20 @@ class TodoApp:
         sb.pack(side="right", fill="y")
         canvas.configure(yscrollcommand=sb.set)
 
+        # Single content frame inside the canvas — widgets pack directly here.
         wrap = tk.Frame(canvas, bg=BG)
         win = canvas.create_window((0, 0), window=wrap, anchor="nw")
-        wrap.bind("<Configure>",
-                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        def _update_scrollregion(_e=None):
+            try:
+                canvas.update_idletasks()
+                bbox = canvas.bbox("all")
+                if bbox:
+                    canvas.configure(scrollregion=bbox)
+            except tk.TclError:
+                pass
+
+        wrap.bind("<Configure>", _update_scrollregion)
         canvas.bind("<Configure>",
                     lambda e: canvas.itemconfig(win, width=e.width))
 
@@ -1656,9 +1717,18 @@ class TodoApp:
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _settings_wheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-        # Inner padded frame — all setting widgets pack into this
-        wrap = tk.Frame(wrap, bg=BG)
-        wrap.pack(fill="both", expand=True, padx=14, pady=10)
+        # Recompute scrollregion once the whole settings view has been built.
+        self.root.after(50, _update_scrollregion)
+        self._settings_update_scrollregion = _update_scrollregion
+
+        # Pad the inside of `wrap` directly via padx/pady on its packed children:
+        # we wrap them in a padded inner frame whose <Configure> also triggers
+        # a scrollregion update so additions/removals (custom pets etc.) resize
+        # the scrollable area correctly.
+        inner = tk.Frame(wrap, bg=BG)
+        inner.pack(fill="both", expand=True, padx=14, pady=10)
+        inner.bind("<Configure>", _update_scrollregion)
+        wrap = inner
 
         # Theme picker
         tk.Label(wrap, text="THEME", bg=BG, fg=MUTED,
@@ -2125,13 +2195,50 @@ class TodoApp:
             '                          fill="#7c2d12", width=1)\n'
         )
 
+        # Sticky button bar at the bottom (built later — pack first so it
+        # always stays visible no matter how short the dialog is).
+        btns = tk.Frame(dlg, bg=BG)
+        btns.pack(side="bottom", fill="x", padx=12, pady=10)
+
+        # Scrollable body
+        sc_outer = tk.Frame(dlg, bg=BG)
+        sc_outer.pack(fill="both", expand=True)
+        sc_canvas = tk.Canvas(sc_outer, bg=BG, highlightthickness=0)
+        sc_canvas.pack(side="left", fill="both", expand=True)
+        sc_bar = ttk.Scrollbar(sc_outer, orient="vertical",
+                               command=sc_canvas.yview)
+        sc_bar.pack(side="right", fill="y")
+        sc_canvas.configure(yscrollcommand=sc_bar.set)
+        body = tk.Frame(sc_canvas, bg=BG)
+        body_win = sc_canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>",
+                  lambda e: sc_canvas.configure(scrollregion=sc_canvas.bbox("all")))
+        sc_canvas.bind("<Configure>",
+                       lambda e: sc_canvas.itemconfig(body_win, width=e.width))
+
+        def _dlg_wheel(event):
+            # Don't hijack wheel from the code editor — let it scroll its own
+            # contents when the cursor is over it.
+            try:
+                if event.widget is txt:
+                    return
+                sc_canvas.yview_scroll(int(-event.delta / 120), "units")
+            except (tk.TclError, NameError):
+                pass
+        sc_canvas.bind("<Enter>",
+                       lambda e: sc_canvas.bind_all("<MouseWheel>", _dlg_wheel))
+        sc_canvas.bind("<Leave>",
+                       lambda e: sc_canvas.unbind_all("<MouseWheel>"))
+        dlg.bind("<Destroy>",
+                 lambda e: sc_canvas.unbind_all("<MouseWheel>"))
+
         # Name / emoji / phrases
         def field_label(text):
-            tk.Label(dlg, text=text, bg=BG, fg=MUTED,
+            tk.Label(body, text=text, bg=BG, fg=MUTED,
                      font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
 
         def text_entry(initial=""):
-            e = tk.Entry(dlg, bg=PANEL2, fg=FG, relief="flat",
+            e = tk.Entry(body, bg=PANEL2, fg=FG, relief="flat",
                          insertbackground=FG, highlightthickness=0)
             if initial:
                 e.insert(0, initial)
@@ -2146,8 +2253,8 @@ class TodoApp:
         phrases_e = text_entry("Hi!, Hello!")
 
         field_label("PYTHON DRAW CODE")
-        code_wrap = tk.Frame(dlg, bg=BG)
-        code_wrap.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+        code_wrap = tk.Frame(body, bg=BG)
+        code_wrap.pack(fill="x", padx=12, pady=(0, 4))
         txt = tk.Text(code_wrap, bg=PANEL2, fg=FG, font=("Consolas", 9),
                       relief="flat", insertbackground=FG, height=14, wrap="none",
                       highlightthickness=0)
@@ -2158,17 +2265,17 @@ class TodoApp:
         txt.insert("1.0", sample)
 
         field_label("PREVIEW")
-        preview = tk.Canvas(dlg, bg=BG, width=160, height=160,
+        preview = tk.Canvas(body, bg=BG, width=160, height=160,
                             highlightthickness=1, highlightbackground=BORDER)
         preview.pack(padx=12, pady=(0, 4))
 
-        err_lbl = tk.Label(dlg, text="", bg=BG, fg=RED,
+        err_lbl = tk.Label(body, text="", bg=BG, fg=RED,
                            font=("Segoe UI", 8), anchor="w", justify="left",
                            wraplength=480)
         err_lbl.pack(fill="x", padx=12, pady=(2, 0))
 
         help_lbl = tk.Label(
-            dlg,
+            body,
             text=("Write a function `def draw_pet(c, s): ...`  (or paste a bare body\n"
                   "that uses `c` and `s`).\n"
                   "  c   = tk.Canvas — use c.create_oval / _polygon / _line / _arc /\n"
@@ -2182,7 +2289,7 @@ class TodoApp:
         help_lbl.pack(fill="x", padx=12, pady=(4, 0))
 
         warn_lbl = tk.Label(
-            dlg,
+            body,
             text="⚠ Code runs every time TodoPet starts. Only paste code you trust.",
             bg=BG, fg=RED, font=("Segoe UI", 8, "italic"),
             anchor="w", justify="left")
@@ -2218,9 +2325,6 @@ class TodoApp:
         txt.bind("<<Paste>>", lambda e: dlg.after(1, update_preview))
         txt.edit_modified(False)
         update_preview()
-
-        btns = tk.Frame(dlg, bg=BG)
-        btns.pack(fill="x", padx=12, pady=10)
 
         def do_save():
             name = name_e.get().strip()
