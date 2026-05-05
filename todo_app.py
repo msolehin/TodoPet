@@ -1065,9 +1065,49 @@ class TodoApp:
         self._rs = None
         self._task_labels = []
 
-        # Pomodoro state
-        self._pomo_mode = "work"  # "work" or "rest"
-        self._pomo_remaining = self.data.get("pomodoro_work", 25 * 60)
+        # Pomodoro state — restore from previous session if available.
+        self._pomo_mode = self.data.get("pomo_mode", "work")
+        if self._pomo_mode not in ("work", "rest"):
+            self._pomo_mode = "work"
+        default_remaining = self.data.get(
+            "pomodoro_work" if self._pomo_mode == "work" else "pomodoro_rest",
+            25 * 60 if self._pomo_mode == "work" else 5 * 60)
+        try:
+            self._pomo_remaining = int(self.data.get("pomo_remaining", default_remaining))
+        except (TypeError, ValueError):
+            self._pomo_remaining = default_remaining
+        was_running = bool(self.data.get("pomo_running", False))
+
+        # If the timer was running when the app last closed, advance it by the
+        # real-world elapsed time so it feels uninterrupted.
+        if was_running:
+            saved_at = self.data.get("pomo_saved_at")
+            if saved_at:
+                try:
+                    last = datetime.fromisoformat(saved_at)
+                    elapsed = int((datetime.now() - last).total_seconds())
+                    if elapsed > 0:
+                        self._pomo_remaining -= elapsed
+                except (ValueError, TypeError):
+                    pass
+
+        # If the elapsed time pushed us past the end of the phase, transition
+        # mode (work→rest or rest→work) once and queue the blink. We do not
+        # try to replay multiple cycles — better to surface the current state
+        # and let the user kick off the next phase.
+        self._pomo_resume_pending = False
+        self._pomo_blink_pending = False
+        if self._pomo_remaining <= 0:
+            if self._pomo_mode == "work":
+                self._pomo_mode = "rest"
+                self._pomo_remaining = self.data.get("pomodoro_rest", 5 * 60)
+            else:
+                self._pomo_mode = "work"
+                self._pomo_remaining = self.data.get("pomodoro_work", 25 * 60)
+            self._pomo_blink_pending = was_running
+        elif was_running:
+            self._pomo_resume_pending = True
+
         self._pomo_running = False
         self._pomo_after = None
         self._pomo_time_lbl = None
@@ -1131,6 +1171,14 @@ class TodoApp:
         root.after(50, lambda: force_taskbar_presence(root))
         # Re-assert topmost when window is mapped (e.g., after restoring from minimized)
         root.bind("<Map>", self._on_map)
+
+        # Restore pomodoro behaviour from the previous session (resume or blink).
+        if self._pomo_resume_pending:
+            self._pomo_resume_pending = False
+            root.after(150, self._pomo_resume_after_restart)
+        elif self._pomo_blink_pending:
+            self._pomo_blink_pending = False
+            root.after(150, self._pomo_start_blink)
 
     def _apply_theme(self):
         set_theme(self.data.get("theme", "Default"))
@@ -1223,9 +1271,13 @@ class TodoApp:
 
     def _close(self):
         try:
-            save_data(self.data)
-        finally:
-            self.root.destroy()
+            self._pomo_persist()
+        except Exception:
+            try:
+                save_data(self.data)
+            except Exception:
+                pass
+        self.root.destroy()
 
     # ---------------- body ----------------
 
@@ -1419,6 +1471,7 @@ class TodoApp:
             self._pomo_running = True
             self._pomo_tick()
         self._pomo_update_labels()
+        self._pomo_persist()
 
     def _pomo_reset(self):
         self._pomo_stop_blink()
@@ -1434,11 +1487,28 @@ class TodoApp:
         else:
             self._pomo_remaining = self.data.get("pomodoro_rest", 5 * 60)
         self._pomo_update_labels()
+        self._pomo_persist()
 
     def _pomo_skip(self):
         self._pomo_stop_blink()
         self._pomo_switch_mode(announce=False)
         self._pomo_update_labels()
+        self._pomo_persist()
+
+    def _pomo_persist(self):
+        """Save pomodoro state to disk so the next launch can resume it."""
+        self.data["pomo_mode"] = self._pomo_mode
+        self.data["pomo_remaining"] = int(max(0, self._pomo_remaining))
+        self.data["pomo_running"] = bool(self._pomo_running)
+        self.data["pomo_saved_at"] = datetime.now().isoformat(timespec="seconds")
+        save_data(self.data)
+
+    def _pomo_resume_after_restart(self):
+        """Resume the timer once the UI has been built (tasks view active)."""
+        self._pomo_running = True
+        self._pomo_update_labels()
+        self._pomo_tick()
+        self._pomo_persist()
 
     def _pomo_switch_mode(self, announce=True):
         if self._pomo_mode == "work":
@@ -1462,10 +1532,16 @@ class TodoApp:
             self._pomo_after = None
             self._pomo_switch_mode(announce=True)
             self._pomo_update_labels()
+            self._pomo_persist()
             self._pomo_start_blink()
             return
         self._pomo_remaining -= 1
         self._pomo_update_labels()
+        # Persist about every 10 seconds while running so a crash doesn't
+        # lose much progress. Also bumps `pomo_saved_at` so the next launch
+        # computes elapsed time from a recent baseline.
+        if self._pomo_remaining % 10 == 0:
+            self._pomo_persist()
         self._pomo_after = self.root.after(1000, self._pomo_tick)
 
     def _pomo_start_blink(self):
