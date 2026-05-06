@@ -82,12 +82,13 @@ def load_data():
             d.setdefault("pomodoro_rest", 5 * 60)
             d.setdefault("focus_ids", [])
             d.setdefault("custom_pets", [])
+            d.setdefault("note", "")
             return d
         except Exception:
             pass
     return {"active": [], "history": [], "pet": "Cat", "theme": "Default", "opacity": 1.0, "next_id": 1,
             "pomodoro_enabled": True, "pomodoro_work": 25 * 60, "pomodoro_rest": 5 * 60,
-            "focus_ids": [], "custom_pets": []}
+            "focus_ids": [], "custom_pets": [], "note": ""}
 
 
 def save_data(d):
@@ -1295,8 +1296,13 @@ class TodoApp:
         self._switch_view(self.view)
 
     def _build_tabs(self, parent):
-        bar = tk.Frame(parent, bg=BG)
-        bar.pack(fill="x", padx=8, pady=(6, 0))
+        # Horizontally scrollable tab strip — tabs live inside a Canvas so they
+        # remain reachable when the window is too narrow to show them all.
+        tabs_canvas = tk.Canvas(parent, bg=BG, highlightthickness=0, height=30)
+        tabs_canvas.pack(fill="x", padx=8, pady=(6, 0))
+
+        bar = tk.Frame(tabs_canvas, bg=BG)
+        tabs_canvas.create_window((0, 0), window=bar, anchor="nw")
 
         tabs = [("tasks", "📋 Tasks"), ("note", "📝 Note"),
                 ("history", "📜 History"), ("settings", "⚙ Settings")]
@@ -1315,6 +1321,40 @@ class TodoApp:
             lbl.bind("<Leave>", lambda e, l=lbl, k=key: l.configure(
                 fg=FG if k == self.view else MUTED))
             self.tab_buttons[key] = (lbl, ind)
+
+        def _update_tabs_scroll(_e=None):
+            try:
+                tabs_canvas.update_idletasks()
+                bbox = tabs_canvas.bbox("all")
+                if bbox:
+                    tabs_canvas.configure(scrollregion=bbox,
+                                          height=max(28, bbox[3] - bbox[1]))
+            except tk.TclError:
+                pass
+
+        bar.bind("<Configure>", _update_tabs_scroll)
+        self.root.after(50, _update_tabs_scroll)
+
+        def _tabs_wheel(event):
+            # Scroll horizontally with the mouse wheel while over the tab bar.
+            try:
+                tabs_canvas.xview_scroll(int(-event.delta / 60), "units")
+            except tk.TclError:
+                pass
+        tabs_canvas.bind("<Enter>",
+                         lambda e: tabs_canvas.bind_all("<MouseWheel>", _tabs_wheel))
+        tabs_canvas.bind("<Leave>",
+                         lambda e: tabs_canvas.unbind_all("<MouseWheel>"))
+
+        # Click-drag to pan horizontally on touchpads / when wheel isn't enough.
+        def _drag_start(e):
+            tabs_canvas.scan_mark(e.x, e.y)
+        def _drag_move(e):
+            tabs_canvas.scan_dragto(e.x, e.y, gain=1)
+        bar.bind("<ButtonPress-2>", _drag_start)
+        bar.bind("<B2-Motion>", _drag_move)
+        tabs_canvas.bind("<ButtonPress-2>", _drag_start)
+        tabs_canvas.bind("<B2-Motion>", _drag_move)
 
         sep = tk.Frame(parent, bg=BORDER, height=1)
         sep.pack(fill="x", padx=10)
@@ -1344,6 +1384,8 @@ class TodoApp:
             self._render_history_view()
         elif self.view == "settings":
             self._render_settings_view()
+        elif self.view == "note":
+            self._render_note_view()
         else:
             self._render_tasks_view()
 
@@ -1758,6 +1800,47 @@ class TodoApp:
         text.tag_configure("done", foreground=GREEN, font=("Segoe UI", 10))
         text.tag_configure("ts", foreground=MUTED, font=("Segoe UI", 9))
         text.configure(state="disabled")
+
+    def _render_note_view(self):
+        hdr = tk.Frame(self.content, bg=BG)
+        hdr.pack(fill="x", padx=10, pady=(8, 4))
+        tk.Label(hdr, text="Quick note", bg=BG, fg=ACCENT,
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+        tk.Label(hdr, text="auto-saves", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8, "italic")).pack(side="right")
+
+        text_wrap = tk.Frame(self.content, bg=BG)
+        text_wrap.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        note = tk.Text(text_wrap, bg=PANEL, fg=FG, font=("Segoe UI", 10),
+                       wrap="word", relief="flat", padx=10, pady=10,
+                       borderwidth=0, highlightthickness=0,
+                       insertbackground=FG, undo=True)
+        note.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(text_wrap, orient="vertical", command=note.yview)
+        sb.pack(side="right", fill="y")
+        note.configure(yscrollcommand=sb.set)
+
+        # Restore previously saved content
+        saved = self.data.get("note", "")
+        if saved:
+            note.insert("1.0", saved)
+
+        # Reset the modified flag so the initial insert doesn't trigger a save.
+        try:
+            note.edit_modified(False)
+        except tk.TclError:
+            pass
+
+        def on_modified(_e=None):
+            try:
+                if note.edit_modified():
+                    self.data["note"] = note.get("1.0", "end-1c")
+                    save_data(self.data)
+                    note.edit_modified(False)
+            except tk.TclError:
+                pass
+
+        note.bind("<<Modified>>", on_modified)
 
     def _render_settings_view(self):
         # Scrollable container so settings remain reachable when the window
