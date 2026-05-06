@@ -1,13 +1,24 @@
 """TodoPet — frameless always-on-top to-do list with a wandering pet companion."""
 import ast
+import base64
+import io
 import json
 import os
 import random
+import subprocess
 import sys
+import tempfile
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
 from pathlib import Path
+
+try:
+    from PIL import Image, ImageGrab, ImageTk
+    _PIL_AVAILABLE = True
+except ImportError:
+    Image = ImageGrab = ImageTk = None
+    _PIL_AVAILABLE = False
 
 APP_NAME = "TodoPet"
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
@@ -1806,7 +1817,9 @@ class TodoApp:
         hdr.pack(fill="x", padx=10, pady=(8, 4))
         tk.Label(hdr, text="Quick note", bg=BG, fg=ACCENT,
                  font=("Segoe UI", 10, "bold")).pack(side="left")
-        tk.Label(hdr, text="auto-saves", bg=BG, fg=MUTED,
+        hint = ("auto-saves · paste images with Ctrl+V"
+                if _PIL_AVAILABLE else "auto-saves · install Pillow for images")
+        tk.Label(hdr, text=hint, bg=BG, fg=MUTED,
                  font=("Segoe UI", 8, "italic")).pack(side="right")
 
         text_wrap = tk.Frame(self.content, bg=BG)
@@ -1820,27 +1833,265 @@ class TodoApp:
         sb.pack(side="right", fill="y")
         note.configure(yscrollcommand=sb.set)
 
-        # Restore previously saved content
+        # Per-render storage. Maps the Text widget's image-name → base64 PNG
+        # so we can serialize to disk; `_note_photos` keeps PhotoImage refs
+        # alive (Tk releases them otherwise).
+        self._note_widget = note
+        self._note_images = {}
+        self._note_photos = []
+        self._note_loading = True
+
+        # Restore previously saved content. Two formats are supported:
+        #   - legacy string  → plain text
+        #   - dict {"blocks": [...]}  → mixed text + image blocks
         saved = self.data.get("note", "")
-        if saved:
-            note.insert("1.0", saved)
+        if isinstance(saved, str):
+            if saved:
+                note.insert("1.0", saved)
+        elif isinstance(saved, dict):
+            for block in saved.get("blocks", []):
+                btype = block.get("type")
+                if btype == "text":
+                    note.insert("end", block.get("text", ""))
+                elif btype == "image" and _PIL_AVAILABLE:
+                    self._insert_note_image_from_b64(block.get("data", ""))
 
         # Reset the modified flag so the initial insert doesn't trigger a save.
         try:
             note.edit_modified(False)
         except tk.TclError:
             pass
+        self._note_loading = False
 
         def on_modified(_e=None):
+            if self._note_loading:
+                return
             try:
                 if note.edit_modified():
-                    self.data["note"] = note.get("1.0", "end-1c")
+                    self.data["note"] = self._serialize_note()
                     save_data(self.data)
                     note.edit_modified(False)
             except tk.TclError:
                 pass
 
         note.bind("<<Modified>>", on_modified)
+        note.bind("<<Paste>>", self._on_note_paste)
+        note.bind("<Control-v>", self._on_note_paste)
+        note.bind("<Control-V>", self._on_note_paste)
+        note.bind("<Button-3>", self._on_note_right_click)
+
+    # ---------------- note image helpers ----------------
+
+    def _serialize_note(self):
+        """Walk the note Text widget and produce a {'blocks': [...]} dict."""
+        note = self._note_widget
+        blocks = []
+        try:
+            items = note.dump("1.0", "end-1c", text=True, image=True)
+        except tk.TclError:
+            return {"blocks": []}
+        for item in items:
+            kind, value, _idx = item[0], item[1], item[2]
+            if kind == "text":
+                if blocks and blocks[-1]["type"] == "text":
+                    blocks[-1]["text"] += value
+                else:
+                    blocks.append({"type": "text", "text": value})
+            elif kind == "image":
+                b64 = self._note_images.get(value)
+                if b64:
+                    blocks.append({"type": "image", "data": b64})
+        return {"blocks": blocks}
+
+    def _insert_note_image_from_b64(self, b64, at="end"):
+        if not _PIL_AVAILABLE or not b64:
+            return None
+        try:
+            png_bytes = base64.b64decode(b64)
+            pil_img = Image.open(io.BytesIO(png_bytes))
+            pil_img.load()
+        except Exception:
+            return None
+        return self._insert_note_pil_image(pil_img, b64=b64, at=at)
+
+    def _insert_note_pil_image(self, pil_img, b64=None, at="insert"):
+        if not _PIL_AVAILABLE:
+            return None
+        # Cap displayed width so huge screenshots don't blow out the layout.
+        # We persist the *original* bytes regardless of display scaling.
+        max_w = 360
+        display_img = pil_img
+        if pil_img.width > max_w:
+            ratio = max_w / pil_img.width
+            new_size = (max_w, max(1, int(pil_img.height * ratio)))
+            display_img = pil_img.resize(new_size, Image.LANCZOS)
+
+        if b64 is None:
+            buf = io.BytesIO()
+            (pil_img if pil_img.mode in ("RGB", "RGBA") else pil_img.convert("RGBA")
+             ).save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+        try:
+            photo = ImageTk.PhotoImage(display_img)
+        except Exception:
+            return None
+        try:
+            name = self._note_widget.image_create(at, image=photo, padx=2, pady=2)
+        except tk.TclError:
+            return None
+        self._note_images[name] = b64
+        self._note_photos.append(photo)
+        return name
+
+    def _on_note_paste(self, _event=None):
+        """If the clipboard has an image, paste it inline. Else fall through to default text paste."""
+        if not _PIL_AVAILABLE:
+            return None
+        try:
+            clip = ImageGrab.grabclipboard()
+        except Exception:
+            clip = None
+        pil_img = None
+        if clip is None:
+            return None
+        if hasattr(clip, "save"):
+            pil_img = clip
+        elif isinstance(clip, list) and clip:
+            for path in clip:
+                try:
+                    pil_img = Image.open(path)
+                    pil_img.load()
+                    break
+                except Exception:
+                    continue
+        if pil_img is None:
+            return None
+        if self._insert_note_pil_image(pil_img, at="insert"):
+            try:
+                self._note_widget.edit_modified(True)
+            except tk.TclError:
+                pass
+            return "break"
+        return None
+
+    def _on_note_right_click(self, event):
+        note = self._note_widget
+        try:
+            idx = note.index(f"@{event.x},{event.y}")
+            items = note.dump(idx, f"{idx}+1c", image=True)
+        except tk.TclError:
+            return None
+        image_name = None
+        for kind, value, _i in items:
+            if kind == "image":
+                image_name = value
+                break
+        menu = tk.Menu(note, tearoff=0, bg=PANEL2, fg=FG,
+                       activebackground=HOVER, activeforeground=FG)
+        if image_name:
+            menu.add_command(label="Copy image",
+                             command=lambda n=image_name: self._copy_note_image(n))
+            menu.add_command(label="Save image as...",
+                             command=lambda n=image_name: self._save_note_image_as(n))
+            menu.add_separator()
+            menu.add_command(label="Delete image",
+                             command=lambda n=image_name: self._delete_note_image(n))
+        else:
+            menu.add_command(label="Copy", command=lambda: note.event_generate("<<Copy>>"))
+            menu.add_command(label="Cut", command=lambda: note.event_generate("<<Cut>>"))
+            menu.add_command(label="Paste", command=lambda: note.event_generate("<<Paste>>"))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _find_note_image_index(self, image_name):
+        try:
+            items = self._note_widget.dump("1.0", "end", image=True)
+        except tk.TclError:
+            return None
+        for kind, value, idx in items:
+            if kind == "image" and value == image_name:
+                return idx
+        return None
+
+    def _delete_note_image(self, image_name):
+        idx = self._find_note_image_index(image_name)
+        if idx is None:
+            return
+        try:
+            self._note_widget.delete(idx, f"{idx}+1c")
+        except tk.TclError:
+            pass
+        self._note_images.pop(image_name, None)
+        try:
+            self._note_widget.edit_modified(True)
+        except tk.TclError:
+            pass
+
+    def _copy_note_image(self, image_name):
+        b64 = self._note_images.get(image_name)
+        if not b64:
+            return
+        if sys.platform != "win32":
+            messagebox.showinfo("Copy image",
+                                "Image clipboard copy is only supported on Windows.\n"
+                                "Use 'Save image as...' instead.",
+                                parent=self.root)
+            return
+        try:
+            png_bytes = base64.b64decode(b64)
+        except Exception:
+            return
+        # Write to a temp PNG and let PowerShell put it on the clipboard via
+        # System.Windows.Forms — most reliable cross-version Windows approach.
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as f:
+                f.write(png_bytes)
+                tmp_path = f.name
+            ps = (
+                "Add-Type -AssemblyName System.Drawing,System.Windows.Forms;"
+                f"$img=[System.Drawing.Image]::FromFile('{tmp_path}');"
+                "[System.Windows.Forms.Clipboard]::SetImage($img);"
+                "$img.Dispose()"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False, timeout=5,
+            )
+            self._pet_say("Copied!")
+        except Exception as ex:
+            messagebox.showerror("Copy image", f"Could not copy: {ex}",
+                                 parent=self.root)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _save_note_image_as(self, image_name):
+        b64 = self._note_images.get(image_name)
+        if not b64:
+            return
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            parent=self.root, defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("All files", "*.*")],
+            initialfile="note-image.png",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(base64.b64decode(b64))
+        except OSError as ex:
+            messagebox.showerror("Save image", f"Could not save: {ex}",
+                                 parent=self.root)
 
     def _render_settings_view(self):
         # Scrollable container so settings remain reachable when the window
