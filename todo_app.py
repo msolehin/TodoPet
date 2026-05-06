@@ -1298,7 +1298,8 @@ class TodoApp:
         bar = tk.Frame(parent, bg=BG)
         bar.pack(fill="x", padx=8, pady=(6, 0))
 
-        tabs = [("tasks", "📋 Tasks"), ("history", "📜 History"), ("settings", "⚙ Settings")]
+        tabs = [("tasks", "📋 Tasks"), ("note", "📝 Note"),
+                ("history", "📜 History"), ("settings", "⚙ Settings")]
         for key, label in tabs:
             col = tk.Frame(bar, bg=BG)
             col.pack(side="left", padx=2)
@@ -1637,6 +1638,7 @@ class TodoApp:
         ids.append(tid)
         save_data(self.data)
         self._render_focus_list()
+        self._refresh_list()
         self._pet_say("Focusing!")
 
     def _remove_from_focus(self, tid):
@@ -1645,6 +1647,7 @@ class TodoApp:
             ids.remove(tid)
             save_data(self.data)
             self._render_focus_list()
+            self._refresh_list()
 
     # ---------------- drag and drop ----------------
 
@@ -2054,12 +2057,17 @@ class TodoApp:
             w.destroy()
         self._task_labels = []
 
-        undone = [t for t in self.data["active"] if not t.get("completed")]
+        # Tasks currently focused in the pomodoro panel are hidden from the
+        # main list; they reappear once removed from the focus zone.
+        focus_ids = set(self.data.get("focus_ids", []))
+        undone = [t for t in self.data["active"]
+                  if not t.get("completed") and t["id"] not in focus_ids]
         done = [t for t in self.data["active"] if t.get("completed")]
         done.sort(key=lambda t: t.get("completed", ""), reverse=True)
 
         if not undone and not done:
-            tk.Label(self.list_inner, text="No tasks yet ✨",
+            msg = "All tasks are in focus 🔥" if focus_ids else "No tasks yet ✨"
+            tk.Label(self.list_inner, text=msg,
                      bg=BG, fg=MUTED, font=("Segoe UI", 9, "italic")).pack(pady=20)
             return
 
