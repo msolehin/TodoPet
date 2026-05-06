@@ -1824,22 +1824,39 @@ class TodoApp:
 
         text_wrap = tk.Frame(self.content, bg=BG)
         text_wrap.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        # Tk's built-in undo doesn't track embedded images, so we manage our
+        # own snapshot-based undo / redo. Disable the native one to avoid two
+        # competing systems.
         note = tk.Text(text_wrap, bg=PANEL, fg=FG, font=("Segoe UI", 10),
                        wrap="word", relief="flat", padx=10, pady=10,
                        borderwidth=0, highlightthickness=0,
-                       insertbackground=FG, undo=True)
+                       insertbackground=FG, undo=False)
         note.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(text_wrap, orient="vertical", command=note.yview)
         sb.pack(side="right", fill="y")
         note.configure(yscrollcommand=sb.set)
 
-        # Per-render storage. Maps the Text widget's image-name → base64 PNG
-        # so we can serialize to disk; `_note_photos` keeps PhotoImage refs
-        # alive (Tk releases them otherwise).
+        # Per-render storage:
+        #   _note_images        : current Tk image-name → base64 PNG
+        #   _note_image_cache   : permanent name → base64 lookup, never trimmed,
+        #                         so undo/redo snapshots can re-insert images
+        #                         that have been removed from the widget.
+        #   _note_photos        : PhotoImage refs (Tk would otherwise GC them)
+        #   _note_undo_stack    : list of prior snapshots (oldest first)
+        #   _note_redo_stack    : list of snapshots ahead of the current state
+        #   _note_current_snapshot : snapshot matching the current widget state
+        # Snapshots are lists of ("text", str) / ("image", name) tuples in
+        # document order; image names are looked up in _note_image_cache.
         self._note_widget = note
         self._note_images = {}
+        self._note_image_cache = {}
         self._note_photos = []
+        self._note_undo_stack = []
+        self._note_redo_stack = []
+        self._note_current_snapshot = []
+        self._note_max_undo = 100
         self._note_loading = True
+        self._note_internal_change = False
 
         # Restore previously saved content. Two formats are supported:
         #   - legacy string  → plain text
@@ -1862,15 +1879,41 @@ class TodoApp:
         except tk.TclError:
             pass
         self._note_loading = False
+        self._note_current_snapshot = self._take_note_snapshot()
 
         def on_modified(_e=None):
-            if self._note_loading:
+            # Skip our own programmatic edits (loading, undo/redo restore).
+            if self._note_loading or self._note_internal_change:
+                try:
+                    note.edit_modified(False)
+                except tk.TclError:
+                    pass
                 return
             try:
-                if note.edit_modified():
-                    self.data["note"] = self._serialize_note()
-                    save_data(self.data)
-                    note.edit_modified(False)
+                if not note.edit_modified():
+                    return
+                # Push the *previous* state onto the undo stack, then capture
+                # the new current state. This works uniformly for text edits
+                # and image inserts/deletes — Ctrl+Z replays in reverse order.
+                self._note_undo_stack.append(self._note_current_snapshot)
+                if len(self._note_undo_stack) > self._note_max_undo:
+                    self._note_undo_stack.pop(0)
+                # A fresh edit invalidates any pending redo branch.
+                self._note_redo_stack.clear()
+                self._note_current_snapshot = self._take_note_snapshot()
+
+                # Drop any images that left the widget so _note_images stays
+                # in sync. The base64 payloads remain in _note_image_cache so
+                # undo can resurrect them.
+                present = {value for kind, value
+                           in self._note_current_snapshot if kind == "image"}
+                for name in list(self._note_images.keys()):
+                    if name not in present:
+                        self._note_images.pop(name, None)
+
+                self.data["note"] = self._snapshot_to_dict(self._note_current_snapshot)
+                save_data(self.data)
+                note.edit_modified(False)
             except tk.TclError:
                 pass
 
@@ -1879,29 +1922,104 @@ class TodoApp:
         note.bind("<Control-v>", self._on_note_paste)
         note.bind("<Control-V>", self._on_note_paste)
         note.bind("<Button-3>", self._on_note_right_click)
+        note.bind("<Control-z>", self._on_note_undo)
+        note.bind("<Control-Z>", self._on_note_undo)
+        note.bind("<Control-y>", self._on_note_redo)
+        note.bind("<Control-Y>", self._on_note_redo)
+        note.bind("<Control-Shift-Z>", self._on_note_redo)
+        note.bind("<Control-Shift-z>", self._on_note_redo)
 
     # ---------------- note image helpers ----------------
 
-    def _serialize_note(self):
-        """Walk the note Text widget and produce a {'blocks': [...]} dict."""
-        note = self._note_widget
-        blocks = []
+    def _take_note_snapshot(self):
+        """Capture the current Text widget contents as a list of
+        ('text', value) / ('image', name) tuples in document order."""
+        snapshot = []
         try:
-            items = note.dump("1.0", "end-1c", text=True, image=True)
+            items = self._note_widget.dump("1.0", "end-1c", text=True, image=True)
         except tk.TclError:
-            return {"blocks": []}
+            return snapshot
         for item in items:
             kind, value, _idx = item[0], item[1], item[2]
+            if kind == "text":
+                snapshot.append(("text", value))
+            elif kind == "image":
+                snapshot.append(("image", value))
+        return snapshot
+
+    def _snapshot_to_dict(self, snapshot):
+        """Convert a snapshot to the persistence format used in data.json."""
+        blocks = []
+        for kind, value in snapshot:
             if kind == "text":
                 if blocks and blocks[-1]["type"] == "text":
                     blocks[-1]["text"] += value
                 else:
                     blocks.append({"type": "text", "text": value})
             elif kind == "image":
-                b64 = self._note_images.get(value)
+                b64 = self._note_image_cache.get(value, "")
                 if b64:
                     blocks.append({"type": "image", "data": b64})
         return {"blocks": blocks}
+
+    def _restore_note_snapshot(self, snapshot):
+        """Replace the Text widget's contents with the given snapshot.
+        Used by undo/redo. Suppresses on_modified bookkeeping via the
+        `_note_internal_change` flag so the restore itself does not push
+        a new entry onto the undo stack."""
+        note = self._note_widget
+        self._note_internal_change = True
+        try:
+            try:
+                note.delete("1.0", "end")
+            except tk.TclError:
+                return
+            self._note_images.clear()
+            self._note_photos.clear()
+            for kind, value in snapshot:
+                if kind == "text":
+                    try:
+                        note.insert("end", value)
+                    except tk.TclError:
+                        pass
+                elif kind == "image":
+                    b64 = self._note_image_cache.get(value, "")
+                    if b64:
+                        self._insert_note_image_from_b64(b64, at="end")
+            try:
+                note.edit_modified(False)
+            except tk.TclError:
+                pass
+        finally:
+            self._note_internal_change = False
+
+    def _on_note_undo(self, _event=None):
+        if not self._note_undo_stack:
+            return "break"
+        self._note_redo_stack.append(self._note_current_snapshot)
+        prev = self._note_undo_stack.pop()
+        self._restore_note_snapshot(prev)
+        self._note_current_snapshot = prev
+        try:
+            self.data["note"] = self._snapshot_to_dict(prev)
+            save_data(self.data)
+        except Exception:
+            pass
+        return "break"
+
+    def _on_note_redo(self, _event=None):
+        if not self._note_redo_stack:
+            return "break"
+        self._note_undo_stack.append(self._note_current_snapshot)
+        nxt = self._note_redo_stack.pop()
+        self._restore_note_snapshot(nxt)
+        self._note_current_snapshot = nxt
+        try:
+            self.data["note"] = self._snapshot_to_dict(nxt)
+            save_data(self.data)
+        except Exception:
+            pass
+        return "break"
 
     def _insert_note_image_from_b64(self, b64, at="end"):
         if not _PIL_AVAILABLE or not b64:
@@ -1941,6 +2059,9 @@ class TodoApp:
         except tk.TclError:
             return None
         self._note_images[name] = b64
+        # Permanent cache so later snapshots / undo can resurrect this image
+        # by name even after it has been removed from the widget.
+        self._note_image_cache[name] = b64
         self._note_photos.append(photo)
         return name
 
@@ -2022,11 +2143,10 @@ class TodoApp:
         if idx is None:
             return
         try:
+            # Just remove the image from the text — the on_modified handler
+            # will detect the missing image, pop it from `_note_images`, and
+            # push its base64 onto the undo trash for Ctrl+Z restoration.
             self._note_widget.delete(idx, f"{idx}+1c")
-        except tk.TclError:
-            pass
-        self._note_images.pop(image_name, None)
-        try:
             self._note_widget.edit_modified(True)
         except tk.TclError:
             pass
